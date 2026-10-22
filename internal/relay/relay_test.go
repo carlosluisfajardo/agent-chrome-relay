@@ -24,6 +24,7 @@ import (
 	op "github.com/1password/onepassword-sdk-go"
 	"github.com/gorilla/websocket"
 
+	"github.com/aindeev/agent-chrome-relay/internal/relayauth"
 	"github.com/aindeev/agent-chrome-relay/internal/vault"
 )
 
@@ -49,6 +50,9 @@ func newHarness(t *testing.T) *harness {
 	os.WriteFile(filepath.Join(home, "token"), []byte("test-secret"), 0o600)
 	os.WriteFile(filepath.Join(home, "config.json"), []byte(`{"extensionIds":["`+extID+`"],"onepassword":{"vault":"Agents"}}`), 0o600)
 	os.WriteFile(filepath.Join(home, "identities.json"), []byte(`{"profiles":{},"sites":{"rules":{},"learned":{}}}`), 0o600)
+	if _, err := relayauth.Provision(home); err != nil {
+		t.Fatal(err)
+	}
 	s, err := New(Options{Home: home, Port: 1})
 	if err != nil {
 		t.Fatal(err)
@@ -84,6 +88,9 @@ type peer struct {
 }
 
 func (h *harness) dial(path string, header http.Header) *peer {
+	if strings.HasPrefix(path, "/extension?") {
+		path += "&nonce=" + strings.Repeat("a", 64)
+	}
 	ws, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(h.srv.URL, "http")+path, header)
 	if err != nil {
 		h.t.Fatal(err)
@@ -104,6 +111,13 @@ func (h *harness) dial(path string, header http.Header) *peer {
 			}
 			var m map[string]any
 			json.Unmarshal(b, &m)
+			if payload, ok := m["payload"].(string); ok {
+				var signed struct {
+					Command map[string]any `json:"command"`
+				}
+				json.Unmarshal([]byte(payload), &signed)
+				m = signed.Command
+			}
 			p.mu.Lock()
 			p.got = append(p.got, m)
 			answer := p.answer
@@ -422,7 +436,7 @@ func TestSocketsClosedDuringChecksAreDiscarded(t *testing.T) {
 
 // ---- 1Password: fills, masking, refusals, approvals
 
-func TestVaultFillsSecretsAgentsNeverSee(t *testing.T) {
+func TestVaultTextFillsAndProtectedRefusals(t *testing.T) {
 	h := newHarness(t)
 	chrome := h.extension("me@example.com")
 	a := h.agent("me@example.com")
@@ -447,32 +461,34 @@ func TestVaultFillsSecretsAgentsNeverSee(t *testing.T) {
 		return out
 	}
 	nav("https://github.com/login")
-	if r := cmd("Input.insertText", map[string]any{"text": "op://Agents/GitHub/password"}); r["result"] == nil {
+	if r := cmd("Input.insertText", map[string]any{"text": "op://Agents/GitHub/username"}); r["result"] == nil {
 		t.Fatal("fill:", r)
 	}
-	if fmt.Sprint(typed()) != "[hunter2-secret]" {
+	if fmt.Sprint(typed()) != "[agent-bot]" {
 		t.Fatal("typed", typed())
 	}
-	if !strings.Contains(fmt.Sprint(h.person.prompts), `let Claude Code (my-repo) fill the password of "GitHub" on github.com`) {
+	if !strings.Contains(fmt.Sprint(h.person.prompts), `let Claude Code (my-repo) fill the username of "GitHub" on github.com`) {
 		t.Error("Touch ID names the agent, item and site:", h.person.prompts)
 	}
 	chrome.mu.Lock()
-	chrome.value = "hunter2-secret"
+	chrome.value = "agent-bot"
 	chrome.mu.Unlock()
-	if r := cmd("Runtime.evaluate", map[string]any{"expression": "document.querySelector('input').value"}); r["result"].(map[string]any)["result"].(map[string]any)["value"] != "••••••••" {
-		t.Error("read back masked:", r)
+	if r := cmd("Runtime.evaluate", map[string]any{"expression": "document.querySelector('input').value"}); r["result"].(map[string]any)["result"].(map[string]any)["value"] != "agent-bot" {
+		t.Error("public text remains readable:", r)
 	}
 	chrome.mu.Lock()
 	chrome.focused = map[string]any{"tag": "INPUT", "type": "text"}
 	chrome.mu.Unlock()
-	if !strings.Contains(errMsg(cmd("Input.insertText", map[string]any{"text": "op://Agents/GitHub/password"})), "only goes into a password field") {
-		t.Error("secrets only into password fields")
+	if !strings.Contains(errMsg(cmd("Input.insertText", map[string]any{"text": "op://Agents/GitHub/password"})), "protected") {
+		t.Error("protected password fills are refused")
 	}
 	cmd("Input.insertText", map[string]any{"text": "op://Agents/GitHub/username"})
-	cmd("Input.insertText", map[string]any{"text": "op://Agents/GitHub/otp"})
+	if !strings.Contains(errMsg(cmd("Input.insertText", map[string]any{"text": "op://Agents/GitHub/otp"})), "protected") {
+		t.Error("protected OTP fill was accepted")
+	}
 	got := typed()
-	if code, _, _ := vault.TOTP("JBSWY3DPEHPK3PXP", time.Now()); len(got) != 3 || got[1] != "agent-bot" || (got[2] != code && len(got[2]) != 6) {
-		t.Error("username and the current one-time code:", got)
+	if len(got) != 2 || got[1] != "agent-bot" {
+		t.Error("only public username text was filled:", got)
 	}
 	if len(h.person.prompts) != 1 {
 		t.Error("one sign-in, one Touch ID:", h.person.prompts)
@@ -487,7 +503,7 @@ func TestVaultFillsSecretsAgentsNeverSee(t *testing.T) {
 	if !strings.Contains(errMsg(cmd("Input.insertText", map[string]any{"text": "op://Private/GitHub/password"})), `only the vaults "Agents"`) {
 		t.Error("other vaults are refused")
 	}
-	if len(typed()) != 3 {
+	if len(typed()) != 2 {
 		t.Error("nothing typed on refusal")
 	}
 	a.mu.Lock()
@@ -498,7 +514,7 @@ func TestVaultFillsSecretsAgentsNeverSee(t *testing.T) {
 	}
 	time.Sleep(100 * time.Millisecond)
 	b, _ := os.ReadFile(filepath.Join(h.home, "audit", time.Now().UTC().Format("2006-01-02")+".jsonl"))
-	if !strings.Contains(string(b), `"event":"1password fill","tab":`+fmt.Sprint(tab)+`,"item":"GitHub","field":"passwd"`) || !strings.Contains(string(b), "not evil.example") || strings.Contains(string(b), "hunter2") {
+	if !strings.Contains(string(b), `"event":"1password fill","tab":`+fmt.Sprint(tab)+`,"item":"GitHub","field":"username"`) || !strings.Contains(string(b), "not evil.example") || strings.Contains(string(b), "hunter2") {
 		t.Error("audit: fills and refusals, no secrets:", string(b))
 	}
 	res, err := http.Get(h.srv.URL + "/vault?token=test-secret")
@@ -525,7 +541,7 @@ func TestPasskeysForThePageItselfAndHandoffs(t *testing.T) {
 	sid, tab := openTab(a, 1)
 	nav := func(u string, ctx int) {
 		chrome.event(tab, "Page.frameNavigated", map[string]any{"frame": map[string]any{"id": "TOP", "url": u}})
-		chrome.event(tab, "Runtime.executionContextCreated", map[string]any{"context": map[string]any{"id": ctx, "auxData": map[string]any{"frameId": "TOP", "isDefault": true}}})
+		chrome.event(tab, "Runtime.executionContextCreated", map[string]any{"context": map[string]any{"id": ctx, "uniqueId": fmt.Sprintf("doc-%d", ctx), "origin": strings.Split(u, "/")[0] + "//" + strings.Split(u, "/")[2], "auxData": map[string]any{"frameId": "TOP", "isDefault": true}}})
 		a.next(func(m map[string]any) bool {
 			p, _ := m["params"].(map[string]any)
 			c, _ := p["context"].(map[string]any)
@@ -735,6 +751,7 @@ func TestDisconnectDuringPopupCreationClosesTheLateTab(t *testing.T) {
 	chrome := h.extension("me@example.com")
 	a := h.agent("me@example.com")
 	_, tab := openTab(a, 1)
+	auditNavigate(t, chrome, a, tab, "opener-doc")
 	chrome.next(method("create")) // the tab's own creation
 	release := make(chan struct{})
 	chrome.peer.mu.Lock()
@@ -831,7 +848,7 @@ func TestPasskeysCanBeTurnedOffOrShareOneTouchID(t *testing.T) {
 		}()})
 	_, tab2 := openTab(a, 2)
 	chrome.event(tab2, "Page.frameNavigated", map[string]any{"frame": map[string]any{"id": "TOP", "url": "https://webauthn.example/login"}})
-	chrome.event(tab2, "Runtime.executionContextCreated", map[string]any{"context": map[string]any{"id": 5, "auxData": map[string]any{"frameId": "TOP", "isDefault": true}}})
+	chrome.event(tab2, "Runtime.executionContextCreated", map[string]any{"context": map[string]any{"id": 5, "uniqueId": "doc-5", "origin": "https://webauthn.example", "auxData": map[string]any{"frameId": "TOP", "isDefault": true}}})
 	a.next(func(m map[string]any) bool { return m["method"] == "Runtime.executionContextCreated" })
 	chrome.event(tab2, "Runtime.bindingCalled", map[string]any{"name": binding, "executionContextId": 5,
 		"payload": `{"op":"webauthn","id":1,"kind":"get","mediation":"","publicKey":{"challenge":{"$b":"AAAA"},"rpId":"webauthn.example"}}`})

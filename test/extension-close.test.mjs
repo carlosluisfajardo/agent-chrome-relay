@@ -33,7 +33,7 @@ test('restart cleanup retains failed tabs and retries before recording the new i
 test('already removed tracked tabs are safely forgotten', async () => {
   const f = await extensionFixture({ saved: { agentTabs: [7] }, tabs: [] });
   await f.handle({ op: 'close', id: 1, tabId: 7 });
-  assert.deepEqual(f.messages.at(-1), { id: 1, result: {} });
+  assert.match(f.messages.at(-1).error, /not owned/);
   assert.deepEqual(f.persisted.agentTabs, []);
 });
 

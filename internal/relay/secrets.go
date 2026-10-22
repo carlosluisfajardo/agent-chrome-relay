@@ -18,9 +18,8 @@ func vaultRef(text string) bool { return vault.Ref.MatchString(text) }
 
 func (a *Agent) who() vault.Who { return vault.Who{Name: describe(a.app, a.cwd), Session: a.sid} }
 
-// fillSecret: `agent-browser fill @e3 "op://Agents/GitHub/password"` types the real value from the shared vault.
-// The agent never gets it back: the vault (and the person's Touch ID) decides, the page's site must be the
-// item's, secrets go only into password fields of the page itself, and anything the page echoes is masked.
+// fillSecret resolves public text (such as a username) inside custody. Protected
+// fields are refused there: arbitrary page scripting makes concealed fills unsafe.
 func (a *Agent) fillSecret(t int, child string, m message, ref string) {
 	p, u := a.p(), a.urls[t]
 	refuse := func(err error) {
@@ -33,8 +32,9 @@ func (a *Agent) fillSecret(t int, child string, m message, ref string) {
 		return
 	}
 	// 1Password and the person's Touch ID take a moment: don't hold the relay meanwhile
+	pageURL := a.targetURLOf(t)
 	a.s.mu.Unlock()
-	v, err := a.s.vault.Resolve(context.Background(), ref, a.targetURLOf(t), a.who())
+	v, err := a.s.vault.ResolveText(context.Background(), ref, pageURL, a.who())
 	a.s.mu.Lock()
 	if err != nil {
 		refuse(err)
@@ -62,19 +62,10 @@ func (a *Agent) fillSecret(t int, child string, m message, ref string) {
 		refuse(errors.New("no text field has focus: use `agent-browser fill @ref <reference>` on the field"))
 	case a.urls[t] != u:
 		refuse(errors.New("the page changed while 1Password answered; fill the field again"))
-	case v.Kind == "secret" && el.Type != "password":
-		what := el.Type
-		if what == "" {
-			what = strings.ToLower(el.Tag)
-		}
-		refuse(fmt.Errorf("%q of %q only goes into a password field, and the focused field is %s", v.Field, v.Item, what))
 	default:
 		if sent := a.cdp(p, t, "Input.insertText", map[string]any{"text": v.Value}); sent.Error != "" {
 			refuse(errors.New(sent.Error))
 			return
-		}
-		if v.Kind == "secret" {
-			a.hide(v.Value)
 		}
 		a.filled[t] = v.Item
 		a.s.audit(a, "1password fill", "tab", t, "item", v.Item, "field", v.Field, "url", u)
@@ -95,24 +86,40 @@ func (a *Agent) targetURLOf(t int) string {
 // the tab's address, never what the page claims, and only for the page itself (top frame, main world).
 func (a *Agent) onWebAuthn(t, id int, c map[string]any, from callFrom) {
 	p := a.p()
+	if !a.pageContext(t, from) || p == nil {
+		return
+	}
 	kind := "get"
 	if c["kind"] == "create" {
 		kind = "create"
 	}
 	mediation, _ := c["mediation"].(string)
 	reply := func(r any) {
+		if !a.pageContext(t, from) || a.p() != p {
+			return
+		}
 		b, _ := json.Marshal(r)
-		a.cdpSend(p, t, "Runtime.evaluate", map[string]any{"expression": fmt.Sprintf("window.__agentBridgeDone && window.__agentBridgeDone(%d, %s)", id, b)})
+		a.cdpSend(p, t, "Runtime.evaluate", map[string]any{"expression": fmt.Sprintf("window.__agentBridgeDone && window.__agentBridgeDone(%d, %s)", id, b), "uniqueContextId": from.uniqueID})
 	}
 	refuse := func(name, why string, kv ...any) {
 		a.s.audit(a, "passkey refused", append([]any{"tab", t, "kind", kind, "url", a.urls[t], "why", why}, kv...)...)
 		a.s.log("passkey", kind, "refused in tab", t, "-", why)
 		reply(map[string]any{"error": name, "message": why})
 	}
-	ctx, ok := a.contexts[t][from.contextID]
-	if from.sessionID != "" || !ok || !ctx.isDefault || ctx.frameID != a.mainFrames[t] {
-		a.s.log("passkey request ignored: not from the page itself, tab", t)
+	if !a.s.passkeySettings().enabled {
+		refuse("NotAllowedError", "passkeys are disabled")
 		return
+	}
+	epoch := a.s.passkeySettings().epoch
+	// Revalidate after every external wait, including signing. Numeric context IDs
+	// and URLs can be reused by a replacement document; uniqueContextId cannot.
+	live := func() bool {
+		settings := a.s.passkeySettings()
+		if a.pageContext(t, from) && a.p() == p && settings.enabled && settings.epoch == epoch {
+			return true
+		}
+		a.s.audit(a, "passkey cancelled", "tab", t, "kind", kind, "why", "originating document ended or passkeys disabled")
+		return false
 	}
 	u, err := url.Parse(a.urls[t])
 	if err != nil || u.Host == "" {
@@ -170,6 +177,9 @@ func (a *Agent) onWebAuthn(t, id int, c map[string]any, from callFrom) {
 	a.s.mu.Unlock()
 	keys, err := a.s.vault.Passkeys(context.Background(), rpID, a.who())
 	a.s.mu.Lock()
+	if !live() {
+		return
+	}
 	if err != nil {
 		handoff("shared vault unavailable: " + err.Error())
 		return
@@ -229,6 +239,9 @@ func (a *Agent) onWebAuthn(t, id int, c map[string]any, from callFrom) {
 		a.s.mu.Unlock()
 		cred, err := passkeys.Authenticate(get, *key, origin, chip, reason)
 		a.s.mu.Lock()
+		if !live() {
+			return
+		}
 		if err != nil {
 			name := "NotAllowedError"
 			var pe *passkeys.Error
@@ -251,6 +264,9 @@ func (a *Agent) onWebAuthn(t, id int, c map[string]any, from callFrom) {
 		}
 	}
 	key, cred, err := passkeys.Register(create, u.Scheme+"://"+u.Host, u.Hostname(), scoped{a.s.chip, a.sid, 0})
+	if !live() {
+		return
+	}
 	if err != nil {
 		var pe *passkeys.Error
 		name := "NotAllowedError"
@@ -264,6 +280,9 @@ func (a *Agent) onWebAuthn(t, id int, c map[string]any, from callFrom) {
 	a.s.mu.Unlock()
 	item, err := a.s.vault.SavePasskey(context.Background(), key, create.RP.Name)
 	a.s.mu.Lock()
+	if !live() {
+		return
+	}
 	if err != nil {
 		refuse("NotAllowedError", "1Password: could not save the passkey: "+err.Error())
 		return

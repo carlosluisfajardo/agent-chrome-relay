@@ -70,8 +70,9 @@ type step struct {
 type pause struct{ done chan struct{} }
 type handoff struct{ rpID, kind string }
 type ctxInfo struct {
-	frameID   string
-	isDefault bool
+	frameID          string
+	isDefault        bool
+	uniqueID, origin string
 }
 type detach struct{ reason, url string }
 type pageCall struct {
@@ -82,6 +83,11 @@ type pageCall struct {
 type callFrom struct {
 	contextID int
 	sessionID string
+	uniqueID  string
+}
+type popupOpener struct {
+	tabID, id int
+	from      callFrom
 }
 
 // Agent: one agent connection. All methods run with s.mu held.
@@ -97,7 +103,6 @@ type Agent struct {
 	child                map[string]int
 	setup                map[int][]step
 	paused               map[int]*pause
-	hidden               []string
 	lastInput            map[int]time.Time
 	contexts             map[int]map[int]ctxInfo
 	handoffs             map[int]handoff
@@ -105,7 +110,7 @@ type Agent struct {
 	targetURLs, urls     map[int]string
 	mainFrames           map[int]string
 	popups               map[string]int
-	openerOf             map[int][2]int
+	openerOf             map[int]popupOpener
 	orphans              []int
 	blocked              string
 	pageQ                chan pageCall
@@ -114,7 +119,7 @@ type Agent struct {
 func (a *Agent) init() {
 	a.tabs, a.child, a.setup, a.paused = map[int]bool{}, map[string]int{}, map[int][]step{}, map[int]*pause{}
 	a.lastInput, a.contexts, a.handoffs, a.filled = map[int]time.Time{}, map[int]map[int]ctxInfo{}, map[int]handoff{}, map[int]string{}
-	a.targetURLs, a.urls, a.mainFrames, a.popups, a.openerOf = map[int]string{}, map[int]string{}, map[int]string{}, map[string]int{}, map[int][2]int{}
+	a.targetURLs, a.urls, a.mainFrames, a.popups, a.openerOf = map[int]string{}, map[int]string{}, map[int]string{}, map[string]int{}, map[int]popupOpener{}
 	// In order: `window.open(); w.location = url` sends "open" then "nav" back to back, and "nav" needs the tab "open" creates.
 	a.pageQ = make(chan pageCall, 1024)
 	go func() {
@@ -162,11 +167,7 @@ func (a *Agent) send(v any) {
 		return
 	}
 	b, _ := json.Marshal(v)
-	s := string(b)
-	for _, h := range a.hidden {
-		s = strings.ReplaceAll(s, h, "••••••••") // a vault secret this agent had typed, read back from the page
-	}
-	a.conn.send([]byte(s))
+	a.conn.send(b)
 }
 
 func trunc(s string, n int) string {
@@ -174,14 +175,6 @@ func trunc(s string, n int) string {
 		return s[:n]
 	}
 	return s
-}
-
-// hide a secret this agent typed, as it would appear inside JSON.
-func (a *Agent) hide(secret string) {
-	if len(secret) >= 4 {
-		b, _ := json.Marshal(secret)
-		a.hidden = append(a.hidden, string(b[1:len(b)-1]))
-	}
 }
 
 func (a *Agent) reply(m message, key string, v any) {
@@ -261,6 +254,10 @@ func (a *Agent) onMessage(m message) {
 		}
 		if tab < 0 || !a.tabs[tab] {
 			a.err(m, "unknown session")
+			return
+		}
+		if !tabCommands[m.Method] {
+			a.err(m, "unsupported shared-profile CDP method: "+m.Method)
 			return
 		}
 		if child == "" && m.Method == "Runtime.runIfWaitingForDebugger" {
@@ -473,7 +470,7 @@ func (a *Agent) prepare(t int, openerID *int) error {
 
 // onPageCall: a message from page script in an agent tab (window.open, popups' postMessage, passkeys).
 func (a *Agent) onPageCall(t int, raw string, from callFrom) {
-	if a.closed {
+	if !a.pageContext(t, from) {
 		return
 	}
 	var c map[string]any
@@ -503,7 +500,7 @@ func (a *Agent) onPageCall(t int, raw string, from callFrom) {
 		return
 	}
 	p := a.p()
-	key := fmt.Sprintf("%d:%d", t, id)
+	key := fmt.Sprintf("%d:%s:%d", t, from.uniqueID, id)
 	switch op {
 	case "open":
 		r := a.s.extCall(p, map[string]any{"op": "create"})
@@ -516,8 +513,12 @@ func (a *Agent) onPageCall(t int, raw string, from callFrom) {
 		}
 		json.Unmarshal(r.Result, &res)
 		popup := res.TabID
+		if !a.pageContext(t, from) {
+			a.s.extSend(p, map[string]any{"op": "close", "tabId": popup})
+			return
+		}
 		a.popups[key] = popup
-		a.openerOf[popup] = [2]int{t, id}
+		a.openerOf[popup] = popupOpener{t, id, from}
 		if e := a.prepare(popup, &id); e != nil {
 			a.s.log("popup setup failed:", e.Error())
 			delete(a.popups, key)
@@ -549,10 +550,18 @@ func (a *Agent) onPageCall(t int, raw string, from callFrom) {
 			a.deliver(p, c, t, pt, "window.opener")
 		}
 	case "toOpener":
-		if o, ok := a.openerOf[t]; ok {
-			a.deliver(p, c, t, o[0], fmt.Sprintf("(window.__agentBridgePopups||{})[%d] || null", o[1]))
+		if o, ok := a.openerOf[t]; ok && a.pageContext(o.tabID, o.from) {
+			a.deliver(p, c, t, o.tabID, fmt.Sprintf("(window.__agentBridgePopups||{})[%d] || null", o.id))
 		}
 	}
+}
+
+// Binding calls retain the execution context observed when Chrome emitted them.
+// Only the live main-world top document has the popup/passkey capability.
+func (a *Agent) pageContext(t int, from callFrom) bool {
+	ctx, ok := a.contexts[t][from.contextID]
+	return !a.closed && a.tabs[t] && from.sessionID == "" && ok && ctx.isDefault &&
+		ctx.frameID == a.mainFrames[t] && ctx.uniqueID != "" && ctx.uniqueID == from.uniqueID && ctx.origin == a.originOf(t)
 }
 
 // originOf a tab: the one the relay saw it navigate to, never what the page claims.
@@ -566,6 +575,16 @@ func (a *Agent) originOf(t int) string {
 
 // deliver postMessage between an opener and its popup; targetOrigin is enforced against the receiver's page.
 func (a *Agent) deliver(p *profile, c map[string]any, from, to int, sourceExpr string) {
+	receiver := ""
+	for id, ctx := range a.contexts[to] {
+		if a.pageContext(to, callFrom{contextID: id, uniqueID: ctx.uniqueID}) {
+			receiver = ctx.uniqueID
+			break
+		}
+	}
+	if receiver == "" {
+		return
+	}
 	raw := c["targetOrigin"]
 	if m, ok := raw.(map[string]any); ok {
 		raw = m["targetOrigin"]
@@ -595,7 +614,7 @@ func (a *Agent) deliver(p *profile, c map[string]any, from, to int, sourceExpr s
 	data, _ := json.Marshal(c["data"])
 	origin, _ := json.Marshal(a.originOf(from))
 	a.cdpSend(p, to, "Runtime.evaluate", map[string]any{"expression": fmt.Sprintf(`(() => { const e = new MessageEvent("message", { data: %s, origin: %s });
-        Object.defineProperty(e, "source", { value: %s }); window.dispatchEvent(e); })()`, data, origin, sourceExpr)})
+		Object.defineProperty(e, "source", { value: %s }); window.dispatchEvent(e); })()`, data, origin, sourceExpr), "uniqueContextId": receiver})
 }
 
 func (a *Agent) popupGone(t int) {
@@ -604,8 +623,8 @@ func (a *Agent) popupGone(t int) {
 		return
 	}
 	delete(a.openerOf, t)
-	if p := a.p(); p != nil {
-		a.cdpSend(p, o[0], "Runtime.evaluate", map[string]any{"expression": fmt.Sprintf("((window.__agentBridgePopups||{})[%d]||{}).closed = true", o[1])})
+	if p := a.p(); p != nil && a.pageContext(o.tabID, o.from) {
+		a.cdpSend(p, o.tabID, "Runtime.evaluate", map[string]any{"expression": fmt.Sprintf("((window.__agentBridgePopups||{})[%d]||{}).closed = true", o.id), "uniqueContextId": o.from.uniqueID})
 	}
 }
 
@@ -693,7 +712,8 @@ func (a *Agent) onExtEvent(e extEvent) bool {
 	json.Unmarshal(e.Params, &P)
 	switch e.Method {
 	case "Page.frameNavigated":
-		if f, ok := P["frame"].(map[string]any); ok && (f["parentId"] == nil || f["parentId"] == "") {
+		if f, ok := P["frame"].(map[string]any); ok && e.SessionID == "" && (f["parentId"] == nil || f["parentId"] == "") {
+			a.contexts[e.TabID] = map[int]ctxInfo{}
 			a.mainFrames[e.TabID] = fmt.Sprint(f["id"])
 			a.onTargetURL(e.TabID, fmt.Sprint(f["url"]))
 		}
@@ -714,7 +734,9 @@ func (a *Agent) onExtEvent(e extEvent) bool {
 				if a.contexts[e.TabID] == nil {
 					a.contexts[e.TabID] = map[int]ctxInfo{}
 				}
-				a.contexts[e.TabID][int(id)] = ctxInfo{fid, def}
+				unique, _ := c["uniqueId"].(string)
+				origin, _ := c["origin"].(string)
+				a.contexts[e.TabID][int(id)] = ctxInfo{frameID: fid, isDefault: def, uniqueID: unique, origin: origin}
 			}
 		case "Runtime.executionContextDestroyed":
 			id, _ := P["executionContextId"].(float64)
@@ -727,7 +749,7 @@ func (a *Agent) onExtEvent(e extEvent) bool {
 		id, _ := P["executionContextId"].(float64)
 		payload, _ := P["payload"].(string)
 		select {
-		case a.pageQ <- pageCall{e.TabID, payload, callFrom{int(id), e.SessionID}}:
+		case a.pageQ <- pageCall{e.TabID, payload, callFrom{int(id), e.SessionID, a.contexts[e.TabID][int(id)].uniqueID}}:
 		default:
 			a.s.log("page call dropped: too many queued")
 		}
@@ -756,6 +778,7 @@ func (a *Agent) onPaused(t int) bool {
 		return false
 	}
 	a.paused[t] = &pause{done: make(chan struct{})}
+	a.contexts[t] = map[int]ctxInfo{}
 	for sid, tt := range a.child {
 		if tt == t {
 			delete(a.child, sid)

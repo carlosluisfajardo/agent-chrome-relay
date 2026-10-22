@@ -1,6 +1,8 @@
 package cli
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"strconv"
@@ -24,6 +26,11 @@ func (c *cli) passkeys() error {
 	case "":
 	case "on", "off":
 		pk.set("enabled", c.arg(2) == "on")
+		var epoch [16]byte
+		if _, err := rand.Read(epoch[:]); err != nil {
+			return err
+		}
+		pk.set("epoch", hex.EncodeToString(epoch[:]))
 	case "reuse":
 		secs := 0
 		if v := c.arg(3); v != "off" && v != "0" {
@@ -48,7 +55,7 @@ func (c *cli) passkeys() error {
 		on = true
 	}
 	if !on {
-		c.printf("Passkeys in agent tabs: off. Pages' own passkey requests are left alone (Chrome refuses them in background tabs).\n")
+		c.printf("Passkeys in agent tabs: off. Prepared tabs refuse relay requests and pending relay completions are revoked. New tabs leave pages' WebAuthn alone.\n")
 		return nil
 	}
 	reuse := 0
