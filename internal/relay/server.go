@@ -398,6 +398,10 @@ func (s *Server) learn(site, account string) {
 // (dropped socket, worker restart) arrives as an error.
 func (s *Server) extSend(p *profile, msg map[string]any) chan extReply {
 	ch := make(chan extReply, 1)
+	if p == nil {
+		ch <- extReply{Error: "extension disconnected"}
+		return ch
+	}
 	p.next++
 	id := p.next
 	msg["id"] = id

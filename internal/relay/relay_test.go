@@ -489,6 +489,106 @@ func TestDisconnectDuringCreationClosesTheLateTab(t *testing.T) {
 	}
 }
 
+func TestExtensionCallWithoutProfileReturnsDisconnect(t *testing.T) {
+	s := &Server{}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ch := s.extSend(nil, map[string]any{"op": "close", "tabId": 101})
+	select {
+	case r := <-ch:
+		if r.Error != "extension disconnected" || len(r.Result) != 0 {
+			t.Fatalf("missing extension did not fail the send: %+v", r)
+		}
+	default:
+		t.Fatal("missing extension left the reply pending")
+	}
+	if r := s.extCall(nil, map[string]any{"op": "create"}); r.Error != "extension disconnected" || len(r.Result) != 0 {
+		t.Fatalf("missing extension did not fail the call: %+v", r)
+	}
+}
+
+func TestExtensionDisconnectDuringCreation(t *testing.T) {
+	for _, agentLeaves := range []bool{false, true} {
+		t.Run(fmt.Sprintf("agent_disconnected_%t", agentLeaves), func(t *testing.T) {
+			h := newHarness(t)
+			extensionGone, agentGone := make(chan struct{}), make(chan struct{})
+			extensionDone := sync.OnceFunc(func() { close(extensionGone) })
+			handler := h.srv.Config.Handler
+			h.srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				handler.ServeHTTP(w, r)
+				if r.URL.Path == "/extension" {
+					extensionDone()
+				} else if r.URL.Path == "/devtools/browser/agent" {
+					close(agentGone)
+				}
+			})
+			chrome := h.extension("me@example.com")
+			type delayedReply struct{ awaiting, received chan extReply }
+			intercepted := make(chan delayedReply, 1)
+			chrome.peer.mu.Lock()
+			answer := chrome.peer.answer
+			chrome.peer.answer = func(m map[string]any) (any, string) {
+				if m["op"] == "create" {
+					// Hold the successful reply until disconnect handling finishes,
+					// reproducing the extension leaving before await resumes.
+					h.s.mu.Lock()
+					p := h.s.profiles["me@example.com"]
+					id := int(m["id"].(float64))
+					d := delayedReply{p.pending[id], make(chan extReply, 1)}
+					p.pending[id] = d.received
+					h.s.mu.Unlock()
+					intercepted <- d
+				}
+				return answer(m)
+			}
+			chrome.peer.mu.Unlock()
+			a := h.agent("me@example.com")
+			a.send(map[string]any{"id": 1, "method": "Target.createTarget", "params": map[string]any{}})
+			d := <-intercepted
+			reply := extReply{Error: "test ended before extension reply"}
+			release := sync.OnceFunc(func() { d.awaiting <- reply })
+			defer release()
+			reply = <-d.received
+			if reply.Error != "" || !strings.Contains(string(reply.Result), `"tabId":101`) {
+				t.Fatalf("create did not return a tab before disconnect: %+v", reply)
+			}
+			chrome.ws.Close()
+			<-extensionGone
+			h.s.mu.Lock()
+			p := h.s.profiles["me@example.com"]
+			var ag *Agent
+			for ag = range h.s.agents {
+			}
+			h.s.mu.Unlock()
+			if p != nil || ag == nil {
+				t.Fatal("extension disconnect did not leave the waiting agent without its profile")
+			}
+			if agentLeaves {
+				a.ws.Close()
+				<-agentGone
+			}
+			release()
+			if agentLeaves {
+				h.s.work.Wait() // Both connection handlers are finished; join the pending create.
+			} else if got := errMsg(a.next(id(1))); !strings.Contains(got, "extension disconnected") {
+				t.Fatalf("create after extension disconnect did not return its error: %q", got)
+			}
+			h.s.mu.Lock()
+			kept := ag.tabs[101] || len(ag.setup[101]) != 0
+			h.s.mu.Unlock()
+			if kept {
+				t.Fatal("failed preparation retained the tab or its setup")
+			}
+			if !agentLeaves {
+				h.extension("me@example.com")
+				if _, tab := openTab(a, 2); tab != 101 {
+					t.Fatalf("create after extension reconnect returned tab %d", tab)
+				}
+			}
+		})
+	}
+}
+
 func TestSocketsClosedDuringChecksAreDiscarded(t *testing.T) {
 	h := newHarness(t)
 	slow := make(chan struct{})
