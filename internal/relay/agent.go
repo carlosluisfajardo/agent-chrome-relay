@@ -320,6 +320,9 @@ func (a *Agent) onMessage(m message) {
 		if r.Error != "" {
 			a.err(m, r.Error)
 		} else {
+			if strings.HasPrefix(m.Method, "Network.") {
+				r.Result = networkResult(m.Method, r.Result)
+			}
 			a.ok(m, r.Result)
 		}
 		return
@@ -710,6 +713,16 @@ func (a *Agent) onExtEvent(e extEvent) bool {
 	}
 	var P map[string]any
 	json.Unmarshal(e.Params, &P)
+	if strings.HasPrefix(e.Method, "Fetch.") {
+		return true
+	}
+	if strings.HasPrefix(e.Method, "Network.") {
+		filtered, supported := networkEvent(e.Method, P)
+		if !supported {
+			return true
+		}
+		e.Params, _ = json.Marshal(filtered)
+	}
 	switch e.Method {
 	case "Page.frameNavigated":
 		if f, ok := P["frame"].(map[string]any); ok && e.SessionID == "" && (f["parentId"] == nil || f["parentId"] == "") {

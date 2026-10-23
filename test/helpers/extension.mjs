@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import vm from 'node:vm';
 import { webcrypto, generateKeyPairSync, sign } from 'node:crypto';
 
-export async function extensionFixture({ remove, get, group, relayJSON, authenticate = true, windowIds = [1], saved = {}, tabs = [7] } = {}) {
+export async function extensionFixture({ remove, get, group, relayJSON, refuseCode, authenticate = true, windowIds = [1], saved = {}, tabs = [7] } = {}) {
   const messages = [], persisted = { ...saved };
   const live = new Set(tabs);
   const groups = new Map(), groupCalls = [], commands = [];
@@ -33,9 +33,10 @@ export async function extensionFixture({ remove, get, group, relayJSON, authenti
       onUpdated: event(), onActivated: event(), onCreated: event(), onRemoved: event() },
   };
   const sockets = [];
-  class Socket { readyState = 1; constructor(url) { this.url = url; this.sequence = 0; sockets.push(this); } send(data) { messages.push(JSON.parse(data)); } close(code) { this.readyState = 3; this.onclose?.({ code }); } }
+  class Socket { readyState = 1; constructor(url) { this.url = url; this.sequence = 0; sockets.push(this); if (refuseCode) queueMicrotask(() => this.close(refuseCode)); } send(data) { messages.push(JSON.parse(data)); } close(code) { this.readyState = 3; this.onclose?.({ code }); } }
+  const startedAt = Date.now();
   let timeOffset = 0;
-  class Clock extends Date { static now() { return Date.now() + timeOffset; } }
+  class Clock extends Date { static now() { return startedAt + timeOffset; } }
   const context = vm.createContext({ chrome, WebSocket: Socket, crypto: webcrypto, console,
     fetch: async () => ({ json: async () => relayJSON ?? ({ port: 9333, publicKey }) }),
     TextEncoder, atob, setTimeout, clearTimeout, Date: Clock, URL });
@@ -49,6 +50,7 @@ export async function extensionFixture({ remove, get, group, relayJSON, authenti
   const receive = async (message, socket = sockets.at(-1)) => { await socket.onmessage({ data: JSON.stringify(message) }); await new Promise(r => setImmediate(r)); };
   if (authenticate) await receive(envelope({ op: 'version', id: 0 }));
   return { ...context.fixture, messages, persisted, live, sockets, groups, groupCalls, commands, envelope, receive,
+    debuggerEvent: async (tabId, method, params) => { for (const listener of chrome.debugger.onEvent.listeners) listener({ tabId }, method, params); await new Promise(r => setImmediate(r)); },
     google: (document) => { context.document = document; return context.fixture.googleAuthStep('fixture@example.test'); },
     created: async (tab) => { live.add(tab.id); await Promise.all(chrome.tabs.onCreated.listeners.map((listener) => listener(tab))); },
     advance: (ms) => { timeOffset += ms; } };

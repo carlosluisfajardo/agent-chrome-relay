@@ -117,6 +117,18 @@ allowlist: cookie, storage, cache-management, service-worker and command-tunneli
 including methods that accept arbitrary origin or browser-context parameters. Normal page scripts retain
 the browser's ordinary origin permissions in the pages the agent visits; this is a shared signed-in profile.
 
+Network monitoring exposes reviewed URL, status, loading and body fields. Cookie metadata, raw HTTP
+headers (including redirect and WebSocket handshake headers), ExtraInfo events and unreviewed Network
+events/fields are withheld. Header maps are empty, and events do not promise withheld ExtraInfo replies.
+Fetch interception/response rewriting and `Network.setExtraHTTPHeaders` are unsupported, including binary
+header forms; these paths can otherwise read or replace shared cookies. Normal navigation, page scripting,
+input and the supported Network monitoring/body commands remain available.
+
+A duplicate-profile refusal may arrive before relay authentication. It pauses reconnects for five minutes
+and retains the extension's tab custody. An unauthenticated refusal cannot close any tab; cleanup still
+requires an authenticated relay command or authenticated disconnect. Ordinary transient disconnects retry
+normally. A process occupying the relay port can delay reconnection, but gains no tab authority from this backoff.
+
 For an existing installation, `update` writes the pin and asks the **running old relay** to reload its own
 extensions before restarting the service. It still refuses busy agents unless `--force` was explicitly used.
 If the old service is unavailable, restore it first; if no extension reconnects, reload this installation's

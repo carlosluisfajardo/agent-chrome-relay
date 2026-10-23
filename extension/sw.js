@@ -71,8 +71,11 @@ function connect() {
     }).catch(error => { console.warn("relay authentication failed", error); sock.close(4003); });
     sock.onclose = (ev) => {
       if (ws === sock) ws = null;
+      // The real duplicate-profile refusal precedes authentication. Backing off
+      // grants no tab authority: keep custody until an authenticated relay acts.
+      if (ev.code === 4009) refusedUntil = Date.now() + 5 * 60 * 1000;
       if (sock.authenticated && ev.code === 4009) {   // only an authenticated relay may trigger cleanup
-        refusedUntil = Date.now() + 5 * 60 * 1000; outbox.length = 0; cleanupPending = true;
+        outbox.length = 0; cleanupPending = true;
         closeAgentTabs().then(() => { cleanupPending = false; }).catch((error) => console.warn("tab cleanup failed; will retry", error));
       }                         // anything else is a blip: keep the tabs, the relay still has their agents (see "config")
     };
