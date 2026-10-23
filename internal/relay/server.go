@@ -2,9 +2,11 @@ package relay
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -23,6 +25,7 @@ import (
 
 	"github.com/aindeev/agent-chrome-relay/internal/macos"
 	"github.com/aindeev/agent-chrome-relay/internal/passkeys"
+	"github.com/aindeev/agent-chrome-relay/internal/relayauth"
 	"github.com/aindeev/agent-chrome-relay/internal/vault"
 )
 
@@ -33,21 +36,23 @@ import (
 
 // Server is one relay instance.
 type Server struct {
-	opt      Options
-	token    string
-	instance string // changes on every relay start: the extension closes tabs a previous relay left
-	mu       sync.Mutex
-	profiles map[string]*profile // email -> the extension connection serving that Chrome profile
-	last     map[string]string   // email -> the extension install that last served it
-	agents   map[*Agent]bool
-	notes    map[int]authNote // tabId -> last Google sign-in hop result, for the agent's error message
-	seq      int
-	vault    *vault.Vault
-	chip     enclave
-	caller   func(remotePort int) Caller
-	isChrome func(pid int) bool
-	logMu    sync.Mutex
-	watchers atomic.Int32 // identity-file watchers running (one per connected extension), for tests
+	opt          Options
+	token        string
+	extensionKey ed25519.PrivateKey
+	instance     string // changes on every relay start: the extension closes tabs a previous relay left
+	mu           sync.Mutex
+	profiles     map[string]*profile // email -> the extension connection serving that Chrome profile
+	last         map[string]string   // email -> the extension install that last served it
+	agents       map[*Agent]bool
+	notes        map[int]authNote // tabId -> last Google sign-in hop result, for the agent's error message
+	seq          int
+	vault        *vault.Vault
+	chip         enclave
+	caller       func(remotePort int) Caller
+	isChrome     func(pid int) bool
+	logMu        sync.Mutex
+	work         sync.WaitGroup // join child work after HTTP admission and connection handlers have ended
+	watchers     atomic.Int32   // identity-file watchers running (one per connected extension), for tests
 	// how often identities.json is checked for changes; how long a command on a tab waiting for the person's
 	// 1Password passkey approval waits before saying so
 	watchEvery, handoffWait time.Duration
@@ -65,6 +70,7 @@ type profile struct {
 	pending map[int]chan extReply
 	seq     int
 	client  string
+	nonce   string
 	prof    string
 	stop    context.CancelFunc
 }
@@ -136,6 +142,10 @@ func New(o Options) (*Server, error) {
 	s := &Server{opt: o, token: strings.TrimSpace(string(tok)), instance: hex.EncodeToString(b), profiles: map[string]*profile{}, last: map[string]string{},
 		agents: map[*Agent]bool{}, notes: map[int]authNote{}, isChrome: isChrome,
 		watchEvery: 2 * time.Second, handoffWait: 15 * time.Second}
+	s.extensionKey, err = relayauth.Load(o.Home)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
 	s.caller = func(port int) Caller { return findCaller(port, os.Getenv("CHROME_RELAY_CHECK_TREE") == "0") }
 	cli := "chrome-relay"
 	if o.Instance != "" {
@@ -182,12 +192,14 @@ var _ passkeys.Chip = scoped{}
 // agent's sign-ins for that long.
 type passkeySettings struct {
 	enabled bool
+	epoch   string
 	reuse   time.Duration
 }
 
 func (s *Server) passkeySettings() passkeySettings {
 	out := passkeySettings{enabled: true}
 	pk, _ := s.config()["passkeys"].(map[string]any)
+	out.epoch, _ = pk["epoch"].(string)
 	if on, ok := pk["enabled"].(bool); ok {
 		out.enabled = on
 	}
@@ -295,13 +307,14 @@ func (s *Server) audit(a *Agent, event string, kv ...any) {
 		b.Write(val)
 	}
 	b.WriteString("}\n")
-	go func(line string, day string) {
+	line, day := b.String(), now.Format("2006-01-02")
+	s.work.Go(func() {
 		f, err := os.OpenFile(filepath.Join(s.opt.Home, "audit", day+".jsonl"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 		if err == nil {
 			f.WriteString(line)
 			f.Close()
 		}
-	}(b.String(), now.Format("2006-01-02"))
+	})
 }
 
 // cleanURL keeps origin and path: no query string or fragment in the audit trail.
@@ -385,12 +398,19 @@ func (s *Server) learn(site, account string) {
 // (dropped socket, worker restart) arrives as an error.
 func (s *Server) extSend(p *profile, msg map[string]any) chan extReply {
 	ch := make(chan extReply, 1)
+	if p == nil {
+		ch <- extReply{Error: "extension disconnected"}
+		return ch
+	}
 	p.next++
 	id := p.next
 	msg["id"] = id
 	p.pending[id] = ch
-	b, _ := json.Marshal(msg)
-	if err := p.conn.send(b); err != nil {
+	b, err := relayauth.Envelope(s.extensionKey, p.nonce, id, msg)
+	if err == nil {
+		err = p.conn.send(b)
+	}
+	if err != nil {
 		delete(p.pending, id)
 		ch <- extReply{Error: "extension connection lost: " + err.Error()}
 		return ch
@@ -416,7 +436,9 @@ func (s *Server) await(ch chan extReply) extReply {
 func (s *Server) extCall(p *profile, msg map[string]any) extReply { return s.await(s.extSend(p, msg)) }
 
 // locked runs f later, under the lock (a promise nobody awaits).
-func (s *Server) locked(f func()) { go func() { s.mu.Lock(); defer s.mu.Unlock(); f() }() }
+func (s *Server) locked(f func()) {
+	s.work.Go(func() { s.mu.Lock(); defer s.mu.Unlock(); f() })
+}
 
 func (s *Server) ext(email string) *profile {
 	if email != "" {
@@ -513,7 +535,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			ags = append(ags, map[string]any{"profile": p, "via": a.app, "tabs": len(a.tabs), "idleSeconds": int(time.Since(a.last).Seconds() + 0.5)})
 		}
 		s.mu.Unlock()
-		js(map[string]any{"profiles": profs, "agents": ags})
+		js(map[string]any{"profiles": profs, "agents": ags, "extensionAuth": "ed25519-v1"})
 	default:
 		w.WriteHeader(404)
 	}
@@ -565,7 +587,7 @@ func (s *Server) accept(w http.ResponseWriter, r *http.Request) {
 	// Hold anything the client sends while we check who it is.
 	early := make(chan []byte, 1024)
 	gone := make(chan struct{})
-	go func() {
+	s.work.Go(func() {
 		defer close(gone)
 		for {
 			_, b, err := ws.ReadMessage()
@@ -574,7 +596,7 @@ func (s *Server) accept(w http.ResponseWriter, r *http.Request) {
 			}
 			early <- b
 		}
-	}()
+	})
 	if r.URL.Path == "/extension" {
 		s.acceptExtension(c, r, prof, port, seq, early, gone)
 		return
@@ -612,6 +634,11 @@ func (s *Server) acceptExtension(c *conn, r *http.Request, prof string, port, se
 		s.log("extension disconnected during connection check")
 		return
 	}
+	nonce := r.URL.Query().Get("nonce")
+	if !regexp.MustCompile(`^[a-f0-9]{64}$`).MatchString(nonce) || len(s.extensionKey) != ed25519.PrivateKeySize {
+		c.close(4003, "extension authentication requires setup and a fresh nonce")
+		return
+	}
 	s.mu.Lock()
 	// One socket per profile, decided by arrival order (this check may finish after a later connection's):
 	//  - same extension install reconnecting: the NEWER connection wins and the older one's waiting calls fail fast;
@@ -631,7 +658,7 @@ func (s *Server) acceptExtension(c *conn, r *http.Request, prof string, port, se
 			c.close(4000, "superseded by a newer connection")
 			return
 		}
-		go prev.conn.close(4000, "replaced by a newer connection")
+		s.work.Go(func() { prev.conn.close(4000, "replaced by a newer connection") })
 	}
 	if last, ok := s.last[prof]; ok && last != client {
 		s.log("a different Chrome profile now serves", prof, "- dropping the previous one's tabs")
@@ -646,7 +673,7 @@ func (s *Server) acceptExtension(c *conn, r *http.Request, prof string, port, se
 	}
 	s.last[prof] = client
 	ctx, stop := context.WithCancel(context.Background())
-	p := &profile{conn: c, pending: map[int]chan extReply{}, seq: seq, client: client, prof: prof, stop: stop}
+	p := &profile{conn: c, pending: map[int]chan extReply{}, seq: seq, client: client, nonce: nonce, prof: prof, stop: stop}
 	s.profiles[prof] = p
 	s.log("extension connected for", prof)
 	config := func() {
@@ -655,7 +682,7 @@ func (s *Server) acceptExtension(c *conn, r *http.Request, prof string, port, se
 	config()
 	s.mu.Unlock()
 	s.watchers.Add(1)
-	go func() { // ping every 20s; re-send config when identities.json changes (polled every 2s, like fs.watchFile)
+	s.work.Go(func() { // ping every 20s; re-send config when identities.json changes (polled every 2s, like fs.watchFile)
 		defer s.watchers.Add(-1)
 		ids := filepath.Join(s.opt.Home, "identities.json")
 		mtime := func() time.Time {
@@ -689,7 +716,7 @@ func (s *Server) acceptExtension(c *conn, r *http.Request, prof string, port, se
 				}
 			}
 		}
-	}()
+	})
 	for {
 		var b []byte
 		select {
@@ -716,7 +743,7 @@ func (s *Server) acceptExtension(c *conn, r *http.Request, prof string, port, se
 			}
 		}
 		s.mu.Lock()
-		go func() { defer s.mu.Unlock(); s.onExtension(p, b) }()
+		s.work.Go(func() { defer s.mu.Unlock(); s.onExtension(p, b) })
 	}
 }
 
@@ -878,7 +905,7 @@ func (s *Server) acceptAgent(c *conn, r *http.Request, prof string, port int, ea
 			continue
 		}
 		s.mu.Lock() // taken here, in arrival order; released by the handler
-		go func() { defer s.mu.Unlock(); a.onMessage(m) }()
+		s.work.Go(func() { defer s.mu.Unlock(); a.onMessage(m) })
 	}
 }
 

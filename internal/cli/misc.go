@@ -207,38 +207,43 @@ func (c *cli) logs() error {
 }
 
 func (c *cli) update() error {
-	var busy int
-	if c.up() {
-		if s, err := c.relayStatus(); err == nil {
-			busy = len(s.Agents)
-		}
+	status, err := c.relayStatus()
+	if err != nil {
+		return fmt.Errorf("cannot update while the current relay is unavailable: %w; restore it before updating", err)
 	}
+	busy := len(status.Agents)
 	if busy > 0 && !hasFlag(c.args, "--force") {
 		return fmt.Errorf("%d agent session(s) are using the relay; updating would cut them off. Retry later or add --force.", busy)
 	}
 	if b, err := os.ReadFile(c.Plist); err != nil || !strings.Contains(string(b), "<string>"+xmlEscape(c.Bin)+"</string>") {
 		fmt.Fprintf(c.errw, "note: the background service does not run %s yet: `%s setup` switches it\n", c.Bin, c.Name)
 	}
-	c.kickstart(true)
-	for range 180 { // the extension reconnects within ~30s (it retries on a 30s alarm)
-		if c.up() {
-			if s, err := c.relayStatus(); err == nil && len(s.Profiles) > 0 {
-				break
-			}
-		}
-		time.Sleep(250 * time.Millisecond)
+	if err := c.pairExtension(); err != nil {
+		return err
 	}
-	time.Sleep(2 * time.Second) // give other profiles a moment to reconnect too
+	// The old service can still address its old extension. Ask it to reload the
+	// newly pinned code BEFORE replacing the service's wire protocol.
 	var r struct {
 		Reloading []string `json:"reloading"`
 	}
 	if err := c.get("/reload-extensions", 3*time.Second, &r); err != nil {
-		return fmt.Errorf("the relay did not come back (%v): run `%s doctor`", err, c.Name)
+		return fmt.Errorf("old extension reload failed; relay was not restarted: %w", err)
 	}
 	if len(r.Reloading) == 0 {
-		c.printf("relay restarted; reloading extension in: no connected profiles yet: run `%s update` again in a minute\n", c.Name)
-	} else {
-		c.println("relay restarted; reloading extension in:", pyRepr(r.Reloading))
+		return fmt.Errorf("no connected extensions to upgrade; reload this installation in Chrome and retry")
 	}
-	return nil
+	time.Sleep(2 * time.Second)
+	if _, err := c.launchctl("kickstart", "-k", c.target()); err != nil {
+		return fmt.Errorf("relay restart failed: %w", err)
+	}
+	for range 180 { // the extension reconnects within ~30s (it retries on a 30s alarm)
+		if c.up() {
+			if s, err := c.relayStatus(); err == nil && s.ExtensionAuth == "ed25519-v1" && len(s.Profiles) > 0 && !slices.ContainsFunc(r.Reloading, func(profile string) bool { return !slices.Contains(s.Profiles, profile) }) {
+				c.println("relay restarted; authenticated extension profiles:", pyRepr(s.Profiles))
+				return nil
+			}
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	return fmt.Errorf("no authenticated extension reconnected; reload this installation in Chrome and run `%s doctor`", c.Name)
 }

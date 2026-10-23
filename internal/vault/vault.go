@@ -310,6 +310,17 @@ type Who struct{ Name, Session string }
 // Resolve: the value a reference stands for, if this page may have it, after the person's approval.
 // Errors are messages for the agent.
 func (v *Vault) Resolve(ctx context.Context, ref, pageURL string, who Who) (Value, error) {
+	return v.resolve(ctx, ref, pageURL, who, false)
+}
+
+// ResolveText is the browser relay's fill capability. The SDK reads whole items,
+// so field classification happens inside custody, before approval, OTP computation
+// or returning a chosen protected value to the relay's script-readable browser.
+func (v *Vault) ResolveText(ctx context.Context, ref, pageURL string, who Who) (Value, error) {
+	return v.resolve(ctx, ref, pageURL, who, true)
+}
+
+func (v *Vault) resolve(ctx context.Context, ref, pageURL string, who Who, textOnly bool) (Value, error) {
 	m := Ref.FindStringSubmatch(strings.TrimSpace(ref))
 	if m == nil {
 		return Value{}, errors.New("not a 1Password secret reference")
@@ -351,6 +362,9 @@ func (v *Vault) Resolve(ctx context.Context, ref, pageURL string, who Who) (Valu
 	f := PickField(it, fieldName, attribute != "")
 	if f == nil {
 		return Value{}, fmt.Errorf("%q has no field %q", it.Title, fieldName)
+	}
+	if textOnly && f.FieldType != op.ItemFieldTypeText {
+		return Value{}, errors.New("protected password and OTP fills are disabled: arbitrary page scripting can read filled values; complete this step yourself")
 	}
 	if err := v.approve(who, it.ID, u.Hostname(), reason, unlocked); err != nil {
 		return Value{}, err

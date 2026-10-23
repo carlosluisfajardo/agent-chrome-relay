@@ -1,6 +1,6 @@
 ---
 name: chrome-relay
-description: Use the person's own signed-in Chrome from the command line, in background tabs, through Chrome Relay. Load this BEFORE any browser step that needs their logins (internal tools, Google-SSO apps, GitHub, admin consoles, staging environments, OAuth consent screens, sign-ins with the 1Password vaults they allowed: passwords, 2-step codes, passkeys) or when they say "check it in the browser", "open it logged in", "click through", "use my Chrome". Never drive their Chrome any other way.
+description: Use the person's own signed-in Chrome from the command line, in background tabs, through Chrome Relay. Load this BEFORE any browser step that needs their logins (internal tools, Google-SSO apps, GitHub, admin consoles, staging environments, OAuth consent screens, public-text fills and passkeys from allowed 1Password vaults) or when they say "check it in the browser", "open it logged in", "click through", "use my Chrome". Never drive their Chrome any other way.
 ---
 
 # Chrome Relay
@@ -24,7 +24,8 @@ Rules:
   logs, PRs, chats or files. Only Claude Code, Codex, Cursor and Paseo processes are accepted.
 - If `chrome-relay` is missing or a connect fails, run `chrome-relay doctor` and tell the person what it says.
   Setup is theirs to do (README of github.com/aindeev/agent-chrome-relay); never install it for them.
-- Google sign-in hops are automatic when the account is already signed in (account chooser, Continue/Allow).
+- Google account selection can be automatic when the account is already signed in. Continue/Allow consent
+  always requires the person to review the application and permissions; account mappings grant no access.
 - Never type credentials you know or pick accounts yourself. The only credentials you may use are the ones in
   the 1Password vaults the person allowed (below), if they set that up. Otherwise, if a command fails with `SIGN-IN NEEDED: ...` (password,
   passkey, 2-step, signed-out account) or you land on a login form: stop, ask the person to sign in in their
@@ -37,21 +38,20 @@ Rules:
 
 ## Signing in with 1Password
 
-If the person has set it up, you sign in with logins from the 1Password vaults they allowed, without ever
-seeing a secret. See what's there (vaults, titles, websites, usernames, and whether each has a password,
+If the person has set it up, you may fill public text such as usernames and use relay passkeys from the
+1Password vaults they allowed. Password and OTP fills are disabled because page scripts can recover filled
+values. See what's there (vaults, titles, websites, usernames, and whether each has a password,
 one-time code or passkey; never values):
 
 ```bash
 chrome-relay vault
 ```
 
-Fill a field with a **secret reference** instead of a value. The relay types the real value into the page:
+Fill a public-text field with a **secret reference** instead of a value:
 
 ```bash
 agent-browser fill @e2 "op://Private/GitHub/username"
-agent-browser fill @e3 "op://Private/GitHub/password"    # password fields only
-agent-browser click @e4
-agent-browser fill @e7 "op://Private/GitHub/otp"         # the current 2-step code (TOTP), computed when typed
+# password and otp references are refused; ask the person to complete those steps
 ```
 
 - **Pick the account deliberately.** The person may have several logins for one site (work and personal,
@@ -61,15 +61,15 @@ agent-browser fill @e7 "op://Private/GitHub/otp"         # the current 2-step co
   names you, the item and the site (once per sign-in or once per session, as they chose). Tell them it's coming;
   the command waits for them. If they decline, the command fails with `1Password: the person did not approve
   with Touch ID`: stop and ask.
-- Field names: `username`, `password`, `otp` (the one-time code), or any other field by its name. The vault
+- Public-text fields: `username` or another public field by its name. Concealed and OTP fields are refused by type. The vault
   is one of the vaults `chrome-relay vault` lists.
 - Use `fill` (one reference, the whole text). `type`, `keyboard` or `eval` would type the reference literally.
 - A value only goes to the item's own website (and its subdomains), over https, into the page itself (not a
-  frame inside it). Passwords and other secret fields only go into password fields. A refusal comes back as
+  frame inside it). Protected fields are refused before the relay receives their chosen value. A refusal comes back as
   `1Password: ...`: tell the person what it says; don't work around it.
 - Never try to read a secret back (eval of a field's value, screenshots of an unmasked field, copying it
-  elsewhere), print it, or paste a reference into anything but a sign-in field. Values that come back through
-  the relay are masked anyway, and every fill, refusal and passkey use is in `chrome-relay audit`.
+  elsewhere), print it, or paste a reference into anything but a sign-in field. There is no masking guarantee.
+  Every fill, refusal and passkey use is in `chrome-relay audit`.
 - Not set up (`chrome-relay vault` says so), or their Chrome Relay was built without 1Password? It's optional,
   and setting it up is the person's job (`chrome-relay vault setup`): ask them, never do it yourself.
 
@@ -93,4 +93,5 @@ Which way depends on what the person set up, and none of it is yours to change (
   Chrome's toolbar (red "key" badge; it opens your tab) and approve in 1Password, then continue once they
   confirm. Don't retry in a loop.
 - **Passkeys turned off** (`chrome-relay passkeys` says so): pages' passkey requests fail in your tabs. Ask the
-  person to sign in another way.
+  person to sign in another way. The relay also revokes pending completions and rejects requests from
+  previously prepared tabs. Navigation ends the old document's passkey capability.

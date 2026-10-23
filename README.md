@@ -26,7 +26,7 @@ agent-browser close
 It's opt-in: nothing installs the extension for you, and it only runs on Macs whose owner set it up.
 
 **The core** is background tabs with your logins, Google sign-in hops and an audit trail. **Everything else is
-optional** and off until you turn it on: signing in with 1Password (passwords, 2-step codes, passkeys) and
+optional** and off until you turn it on: 1Password public-text fills and stored passkeys, and
 Secure Enclave passkeys. See [What's optional](#whats-optional).
 
 ## How it works
@@ -51,8 +51,10 @@ agent-browser (CLI) ──ws──▶ relay (127.0.0.1:9333, LaunchAgent) ──
 Fastest: paste [this prompt](https://agent-chrome-relay.aindeev.com/setup-prompt.txt) into Claude Code, Codex or
 Cursor and let your agent do it. By hand:
 
-Needs macOS, Google Chrome, [Go](https://go.dev/dl/) 1.25+ (`brew install go`) and
+Needs macOS, Google Chrome **137 or newer**, [Go](https://go.dev/dl/) 1.25+ (`brew install go`) and
 [`agent-browser`](https://github.com/vercel-labs/agent-browser) (`npm i -g agent-browser`).
+The extension enforces Chrome 137 as its minimum because relay authentication requires
+[Ed25519 in Web Cryptography](https://developer.chrome.com/release-notes/137#ed25519-in-web-cryptography).
 
 ```bash
 git clone https://github.com/aindeev/agent-chrome-relay
@@ -107,14 +109,44 @@ checkout's extension** may connect as the extension: Chrome derives an unpacked 
 `setup` records that ID in `~/.chrome-relay/config.json`, the relay checks the connection's
 `Origin: chrome-extension://<id>` (which pages cannot fake), and the connecting process must be Chrome.
 
+The extension also authenticates the relay: setup pins an Ed25519 public key in `extension/relay.json`.
+Every command is signed, bound to a fresh connection nonce, and checked in sequence before execution.
+The signing key stays in the installation's private data folder. Missing or invalid pins fail closed.
+Only extension-owned tabs accept CDP or close commands. CDP forwarding uses an explicit supported-method
+allowlist: cookie, storage, cache-management, service-worker and command-tunneling APIs are unsupported,
+including methods that accept arbitrary origin or browser-context parameters. Normal page scripts retain
+the browser's ordinary origin permissions in the pages the agent visits; this is a shared signed-in profile.
+
+Network monitoring exposes reviewed URL, status, loading and body fields. Cookie metadata, raw HTTP
+headers (including redirect and WebSocket handshake headers), ExtraInfo events and unreviewed Network
+events/fields are withheld. Header maps are empty, and events do not promise withheld ExtraInfo replies.
+Fetch interception/response rewriting and `Network.setExtraHTTPHeaders` are unsupported, including binary
+header forms; these paths can otherwise read or replace shared cookies. Normal navigation, page scripting,
+input and the supported Network monitoring/body commands remain available.
+
+A duplicate-profile refusal may arrive before relay authentication. It pauses reconnects for five minutes
+and retains the extension's tab custody. An unauthenticated refusal cannot close any tab; cleanup still
+requires an authenticated relay command or authenticated disconnect. Ordinary transient disconnects retry
+normally. A process occupying the relay port can delay reconnection, but gains no tab authority from this backoff.
+
+For an existing installation, `update` writes the pin and asks the **running old relay** to reload its own
+extensions before restarting the service. It still refuses busy agents unless `--force` was explicitly used.
+If the old service is unavailable, restore it first; if no extension reconnects, reload this installation's
+extension in Chrome. The directory and extension ID stay the same. Keep the old source/binary and metadata
+as the rollback pair: an old extension does not understand signed commands, and a new extension refuses an
+unsigned old server. This upgrade requires both halves; a successful merge alone does not install it.
+
 This keeps other local tools, web pages and accidents out. It is not a boundary against malware already
 running as you, which could read the secret and fake the markers.
 
 ## Sign-ins
 
 Agents never type credentials they know. When a site bounces through Google and the right account is **already signed
-in**, the extension clicks the account and **Continue/Allow** itself (page scripting, so it works even with
-1Password's frame on the page). A password, passkey, 2-step screen or signed-out account stops the hop, and the
+in**, the extension can select that account. **Continue/Allow consent always waits for the person** to review
+the application and requested permissions. Account mappings select an identity and never authorize a grant.
+Automatic selection requires a visible "Choose an account" heading and a matching account link with no
+button or submit ancestor. Other page shapes and localized headings require the person to choose.
+A password, passkey, 2-step screen or signed-out account also stops the hop, and the
 agent gets `SIGN-IN NEEDED: ...` and asks you to sign in in your own window.
 
 Which Google account a site uses comes from `~/.chrome-relay/identities.json` (`chrome-relay identities`):
@@ -128,20 +160,29 @@ Nothing below happens unless you set it up, and each part can be turned off agai
 | Feature | Default | Turn on | Turn off |
 |---|---|---|---|
 | Background tabs, Google sign-in hops, audit trail | on | `./chrome-relay setup` | `chrome-relay uninstall` |
-| Signing in with 1Password (passwords, 2-step codes) | **off** | `chrome-relay vault setup` | `chrome-relay vault forget` |
+| 1Password public-text fills and relay passkey storage | **off** | `chrome-relay vault setup` | `chrome-relay vault forget` |
 | Passkeys in agent tabs | on: 1Password's own prompt answers, or Chrome Relay's Secure Enclave passkeys if you have 1Password set up | `chrome-relay passkeys on` | `chrome-relay passkeys off` |
 | One Touch ID for several passkey sign-ins | **off** (every signature asks) | `chrome-relay passkeys reuse 120` (1–300 s) | `chrome-relay passkeys reuse off` |
 
-With passkeys off, agent tabs leave pages' WebAuthn alone (Chrome then refuses it in background tabs, as it
-would anyway). With no vault set up, the relay never talks to 1Password, prompts for nothing and stores no
+With passkeys off, new tabs leave pages' WebAuthn alone (Chrome then refuses it in background tabs).
+Already-prepared tabs refuse new relay passkey requests, and pending relay completions are revoked, even
+if passkeys are subsequently turned on. Completion is bound to the originating live document's unique
+execution context. A navigated or replaced document cannot receive an earlier assertion. A signature or
+vault write already underway may finish, but its result is not delivered after revocation.
+With no vault set up, the relay never talks to 1Password, prompts for nothing and stores no
 token.
 
 ## Signing in with 1Password (optional)
 
 Needs a build with Xcode's command line tools (see Setup).
 
-Agents can sign in with logins from 1Password: passwords, 2-step codes (TOTP) and passkeys. They never see a
-value: they name an item, and the relay types the value into the page, only on that item's website.
+Agents can fill public text such as usernames and use relay passkeys from the allowed vaults.
+**Protected password and OTP fills are disabled.** Arbitrary page evaluation can recover filled secrets as
+character codes, encoded strings, network traffic or other representations; literal masking cannot prevent
+that. The custody layer classifies the selected field and refuses concealed/TOTP values before returning
+them to the relay or computing an OTP. Only fields explicitly classified as text are accepted; unknown
+and other field types are refused too. Its SDK still retrieves whole items internally to classify fields.
+Complete protected fill steps yourself. Public text remains visible to scripts and agents.
 
 ```bash
 chrome-relay vault setup     # pick your 1Password accounts and which of their vaults agents may use
@@ -166,24 +207,23 @@ and the relay types the real value:
 
 ```bash
 agent-browser fill @e2 "op://Private/Twilio/username"
-agent-browser fill @e3 "op://Private/Twilio/password"
-agent-browser fill @e7 "op://Private/Twilio/otp"      # the current one-time code, computed from the item's TOTP secret
+# password and otp references are refused; complete those steps yourself
 ```
 
 - **Which account.** You may have several logins for one site (three Twilio items, say). The relay never picks:
   the agent names the item, choosing by the vault, title and username `chrome-relay vault` shows it, and asks you
   when your request doesn't say which.
 - **Chrome Relay asks too, with the details.** Its own Touch ID prompt names the agent, item and site:
-  *"chrome-relay is trying to let Claude Code (my-repo) fill the password of "Twilio" on www.twilio.com"*. How
+  *"chrome-relay is trying to let Claude Code (my-repo) fill the username of "Twilio" on www.twilio.com"*. How
   often is yours to choose in setup: **once per agent session** (the default with the 1Password app: one tap,
   naming the vaults, covers that agent's sign-ins until it disconnects), **every sign-in** (one tap covers that
-  agent, item and site for a minute: username, password, one-time code), or **never** (1Password's prompt only).
+  agent, item and site for a minute), or **never** (1Password's prompt only).
   Decline anything you didn't expect.
 - **Only the item's site.** A value is typed only into a page whose host is the item's website or a subdomain
   of it, over https (or `localhost`), in the page itself rather than a frame inside it, like 1Password's own
   filling. References to any other vault are refused.
-- **Secrets only into password fields**, so they show as dots on screen and in the agent's snapshots. If the
-  agent (or the page) reads a filled secret back, the relay masks it in everything it sends the agent.
+- **No protected fills or masking promise.** Concealed and TOTP fields are refused by type, including aliases.
+  Replies remain valid typed JSON; the relay does not rewrite serialized JSON with secret substrings.
 - **Passkeys, in this Mac's Secure Enclave.** Chrome won't run WebAuthn in a background tab, and 1Password's
   passkey prompt would knock the debugger off the page, so agent tabs hand `navigator.credentials.create/get` to
   the relay, which acts as the authenticator (ES256, no attestation). The keys themselves are made by the Mac's

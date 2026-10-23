@@ -3,8 +3,17 @@
 // activated: they are created inactive and kept in one collapsed "Agents" tab group per window.
 // The relay's port: 9333, or what `chrome-relay setup` wrote to relay.json next to this file (a dev-mode install
 // from a second checkout runs its own relay on another port).
-const relayPort = (async () => Number((await (await fetch(chrome.runtime.getURL("relay.json"))).json()).port) || 9333)().catch(() => 9333);
-relayPort.then((port) => port !== 9333 && chrome.action.setTitle({ title: `Chrome Relay (dev mode, relay on port ${port})` }));
+const relayConfig = (async () => {
+  const config = await (await fetch(chrome.runtime.getURL("relay.json"))).json();
+  if (!Number.isInteger(config.port) || config.port < 1 || config.port > 65535 || typeof config.publicKey !== "string") throw new Error("Run setup to pin the relay public key");
+  const raw = Uint8Array.from(atob(config.publicKey.replace(/-/g, "+").replace(/_/g, "/")), c => c.charCodeAt(0));
+  const key = await crypto.subtle.importKey("raw", raw, "Ed25519", false, ["verify"]);
+  return { ...config, key };
+})();
+// A missing pin fails closed. Never fall back to an unauthenticated listener.
+const relayPort = relayConfig.then(config => config.port);
+relayPort.catch(error => console.warn("relay configuration unavailable", error));
+relayPort.then((port) => port !== 9333 && chrome.action.setTitle({ title: `Chrome Relay (dev mode, relay on port ${port})` })).catch(() => {});
 let ws = null, email = "";
 const agentTabs = new Set();
 const agentGroups = new Map();    // windowId -> the tab group THIS extension created for agents (never matched by title)
@@ -17,6 +26,7 @@ const closing = new Set();        // agent tabs this extension is closing on pur
 const restored = chrome.storage.session.get(["agentTabs", "agentGroups"]).then(async (saved) => {
   for (const t of saved.agentTabs || []) if (await chrome.tabs.get(t).catch(() => null)) agentTabs.add(t);
   for (const [w, g] of saved.agentGroups || []) agentGroups.set(w, g);
+  await remember();
 }).catch(() => {});
 
 let connecting = null;            // the one connection attempt in flight, if any
@@ -38,18 +48,38 @@ function connect() {
     // A stable id for this install, so the relay can tell "the same extension reconnecting" from "another profile".
     let { clientId } = await chrome.storage.local.get(["clientId"]);
     if (!clientId) { clientId = crypto.randomUUID(); await chrome.storage.local.set({ clientId }); }
-    const sock = new WebSocket(`ws://127.0.0.1:${await relayPort}/extension?profile=${encodeURIComponent(email)}&client=${clientId}`);
+    const config = await relayConfig;
+    const nonce = [...crypto.getRandomValues(new Uint8Array(32))].map(v => v.toString(16).padStart(2, "0")).join("");
+    const sock = new WebSocket(`ws://127.0.0.1:${config.port}/extension?profile=${encodeURIComponent(email)}&client=${clientId}&nonce=${nonce}`);
     ws = sock;
-    sock.onmessage = (e) => handle(JSON.parse(e.data)).catch((err) => console.warn(err));
-    sock.onopen = flush;
+    sock.authenticated = false;
+    let sequence = 0, received = Promise.resolve();
+    // Verification is serialized, but command execution is not: a slow command must not block unrelated replies.
+    sock.onmessage = (e) => received = received.then(async () => {
+      if (ws !== sock || sock.readyState !== 1) return;
+      const envelope = JSON.parse(e.data);
+      if (typeof envelope.payload !== "string" || typeof envelope.signature !== "string") throw new Error("unsigned relay command");
+      const signature = Uint8Array.from(atob(envelope.signature.replace(/-/g, "+").replace(/_/g, "/")), c => c.charCodeAt(0));
+      if (!await crypto.subtle.verify("Ed25519", config.key, signature, new TextEncoder().encode(envelope.payload))) throw new Error("invalid relay signature");
+      if (ws !== sock || sock.readyState !== 1) return;
+      const signed = JSON.parse(envelope.payload);
+      if (signed.nonce !== nonce || signed.sequence !== sequence + 1) throw new Error("stale relay command");
+      sequence = signed.sequence;
+      sock.authenticated = true;
+      flush();
+      handle(signed.command).catch(error => console.warn(error));
+    }).catch(error => { console.warn("relay authentication failed", error); sock.close(4003); });
     sock.onclose = (ev) => {
       if (ws === sock) ws = null;
-      if (ev.code === 4009) {   // refused: this profile serves no agents, so drop what it holds and stop retrying for 5 minutes
-        refusedUntil = Date.now() + 5 * 60 * 1000; outbox.length = 0; cleanupPending = true;
+      // The real duplicate-profile refusal precedes authentication. Backing off
+      // grants no tab authority: keep custody until an authenticated relay acts.
+      if (ev.code === 4009) refusedUntil = Date.now() + 5 * 60 * 1000;
+      if (sock.authenticated && ev.code === 4009) {   // only an authenticated relay may trigger cleanup
+        outbox.length = 0; cleanupPending = true;
         closeAgentTabs().then(() => { cleanupPending = false; }).catch((error) => console.warn("tab cleanup failed; will retry", error));
       }                         // anything else is a blip: keep the tabs, the relay still has their agents (see "config")
     };
-  })().finally(() => { connecting = null; });
+  })().catch(error => console.warn("relay connection unavailable", error)).finally(() => { connecting = null; });
   return connecting;
 }
 // Close every tab this extension opened for agents, and nothing else (tracked by id, not by group title).
@@ -85,12 +115,12 @@ async function closeTrackedTab(tabId, detach = false) {
 // they wait in a small queue instead of being dropped.
 const outbox = [];
 const send = (m) => {
-  if (ws && ws.readyState === 1) return ws.send(JSON.stringify(m));
+  if (ws && ws.readyState === 1 && ws.authenticated) return ws.send(JSON.stringify(m));
   if (Date.now() < refusedUntil) return;   // refused by the relay: nothing to deliver to
   outbox.push(m); if (outbox.length > 500) outbox.shift();
   connect();
 };
-const flush = () => { while (outbox.length && ws && ws.readyState === 1) ws.send(JSON.stringify(outbox.shift())); };
+const flush = () => { while (outbox.length && ws && ws.readyState === 1 && ws.authenticated) ws.send(JSON.stringify(outbox.shift())); };
 
 async function agentGroup(windowId) {
   await restored;
@@ -116,6 +146,7 @@ async function handle(m) {
   if (m.op === "ping") return send({ id: m.id, result: {} });
   if (m.op === "reload") { send({ id: m.id, result: {} }); return chrome.runtime.reload(); }  // pick up a new version from disk
   try {
+    if (["cdp", "close", "handoff"].includes(m.op) && !agentTabs.has(m.tabId)) throw new Error("tab is not owned by this extension");
     if (m.op === "config") {
       siteAccounts = m.siteAccounts || {};
       // A different relay instance means the relay restarted and its agents are gone: close the tabs it left.
@@ -192,22 +223,30 @@ chrome.action?.onClicked.addListener(async () => {   // (absent in the extension
 });
 
 // Google sign-in hops (IAP, "Sign in with Google"): when the right account is ALREADY signed in, click it
-// and the "Continue"/"Allow" button, like you would. Never types anything: a password, passkey or
+// only the account row. Consent always requires the person; an account mapping grants no OAuth scopes.
+// Never types anything: a password, passkey or
 // 2-step screen, or a signed-out account, stops the hop and is reported so the agent asks you.
 function googleAuthStep(account) {
   const visible = (el) => el && el.offsetParent !== null;
   const text = document.body ? document.body.innerText : "";
   if ([...document.querySelectorAll('input[type="password"], input[type="tel"]')].some(visible) || /passkey|2-Step|Verify it.s you|Enter your password/i.test(text))
     return { state: "needs_user", why: "Google is asking for a password, passkey or verification" };
+  const btn = [...document.querySelectorAll('button, [role="button"]')].filter(visible).find((b) => /^(continue|allow)$/i.test(b.innerText.trim()));
+  if (btn) return { state: "needs_user", why: "Google consent requires you to review the application and permissions and choose Continue or Allow" };
   const rows = [...document.querySelectorAll("[data-identifier], [data-email]")].filter(visible);
   if (rows.length) {
     const row = rows.find((r) => (r.getAttribute("data-identifier") || r.getAttribute("data-email") || "").toLowerCase() === account.toLowerCase());
     if (!row) return { state: "needs_user", why: `${account} is not signed in to Google in this profile` };
     if (/signed out/i.test(row.innerText)) return { state: "needs_user", why: `${account} is signed out of Google in this profile` };
-    (row.closest('[role="link"], li, button') || row).click(); return { state: "clicked", what: `account ${account}` };
+    // Identity metadata also appears inside consent controls. Only a recognizable
+    // account chooser's link is automatic; never promote a row to a button/submit
+    // ancestor, whose aggregate text may include both consent and the account.
+    const chooser = [...document.querySelectorAll('h1, h2, [role="heading"]')].some((h) => visible(h) && /^choose an account$/i.test(h.innerText.trim()));
+    const choice = row.closest('[role="link"]');
+    if (!chooser || !choice || row.closest('button, [role="button"], input[type="submit"]'))
+      return { state: "needs_user", why: "Google account selection is ambiguous; choose the account and review any permissions yourself" };
+    choice.click(); return { state: "clicked", what: `account ${account}` };
   }
-  const btn = [...document.querySelectorAll('button, [role="button"]')].filter(visible).find((b) => /^(continue|allow)$/i.test(b.innerText.trim()));
-  if (btn) { btn.click(); return { state: "clicked", what: btn.innerText.trim() }; }
   return { state: "waiting" };
 }
 function hostOfAuth(u) {

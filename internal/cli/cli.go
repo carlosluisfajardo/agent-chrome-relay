@@ -238,8 +238,9 @@ func (c *cli) get(path string, timeout time.Duration, v any) error {
 }
 
 type relayStatus struct {
-	Profiles []string          `json:"profiles"`
-	Agents   []json.RawMessage `json:"agents"`
+	ExtensionAuth string            `json:"extensionAuth"`
+	Profiles      []string          `json:"profiles"`
+	Agents        []json.RawMessage `json:"agents"`
 }
 
 func (c *cli) relayStatus() (relayStatus, error) {

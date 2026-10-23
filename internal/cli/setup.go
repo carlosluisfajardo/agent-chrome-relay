@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -13,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aindeev/agent-chrome-relay/internal/relayauth"
 	"github.com/aindeev/agent-chrome-relay/internal/vault"
 )
 
@@ -105,8 +107,7 @@ func (c *cli) setup() error {
 	if err := os.MkdirAll(c.Home, 0o700); err != nil {
 		return err
 	}
-	// which relay this checkout's extension dials
-	if err := os.WriteFile(filepath.Join(c.Ext, "relay.json"), fmt.Appendf(nil, `{"port": %d}`, c.Port), 0o644); err != nil {
+	if err := c.pairExtension(); err != nil {
 		return err
 	}
 	// only this checkout's extension may connect to the relay (it checks the connection's origin)
@@ -225,6 +226,28 @@ Last step, by hand, in EACH Chrome profile agents should use (nothing installs i
   3. Load unpacked -> %s
 Then run `+"`%s doctor`"+".\n", c.Ext, c.Name)
 	return nil
+}
+
+// pairExtension updates only this installation's pin, with an atomic metadata replacement.
+func (c *cli) pairExtension() error {
+	publicKey, err := relayauth.Provision(c.Home)
+	if err != nil {
+		return err
+	}
+	b, _ := json.Marshal(map[string]any{"port": c.Port, "publicKey": publicKey})
+	f, err := os.CreateTemp(c.Ext, ".relay-*.json")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(f.Name())
+	if _, err = f.Write(b); err != nil {
+		f.Close()
+		return err
+	}
+	if err = f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(f.Name(), filepath.Join(c.Ext, "relay.json"))
 }
 
 // bootstrap loads the LaunchAgent. Right after a bootout launchd can still be tearing the old one down, so retry
