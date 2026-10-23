@@ -19,6 +19,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	op "github.com/1password/onepassword-sdk-go"
@@ -33,16 +34,17 @@ const extID = "abcdefghijklmnopabcdefghijklmnop"
 // harness: a real relay on a test server; who connects is decided by the test (no lsof/ps), and so is 1Password
 // (an in-memory vault) and the Secure Enclave (software keys).
 type harness struct {
-	t      *testing.T
-	s      *Server
-	srv    *httptest.Server
-	home   string
-	mu     sync.Mutex
-	caller Caller
-	chrome bool
-	store  *memStore
-	person *memPerson
-	chip   *softChip
+	t        *testing.T
+	s        *Server
+	srv      *httptest.Server
+	home     string
+	mu       sync.Mutex
+	caller   Caller
+	chrome   bool
+	store    *memStore
+	person   *memPerson
+	chip     *softChip
+	handlers sync.WaitGroup
 }
 
 func newHarness(t *testing.T) *harness {
@@ -63,9 +65,68 @@ func newHarness(t *testing.T) *harness {
 	s.isChrome = func(int) bool { h.mu.Lock(); defer h.mu.Unlock(); return h.chrome }
 	s.vault = &vault.Vault{Settings: s.vaultSettings, Person: h.person, Connect: func(context.Context, string, string) (vault.Store, error) { return h.store, nil }}
 	s.chip = h.chip
-	h.srv = httptest.NewServer(s)
-	t.Cleanup(h.srv.Close)
+	h.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h.handlers.Add(1)
+		defer h.handlers.Done()
+		s.ServeHTTP(w, r)
+	}))
+	t.Cleanup(h.close)
 	return h
+}
+
+func (h *harness) close() {
+	// Client cleanups run first (registered later). HTTP Close does not join
+	// hijacked WebSockets; their handlers can still log and launch audit writes.
+	h.srv.Close()
+	h.handlers.Wait()
+	h.s.work.Wait()
+}
+
+func TestHarnessCleanupWaitsForWriters(t *testing.T) {
+	// Close the listener before entering the bubble: the lifetime assertion uses
+	// channels, not network timing or sleeps, to hold a pending teardown writer.
+	srv := httptest.NewServer(http.NotFoundHandler())
+	srv.Close()
+	for _, source := range []string{"hijacked handler", "background work"} {
+		t.Run(source, func(t *testing.T) {
+			home := t.TempDir()
+			if err := os.Mkdir(filepath.Join(home, "audit"), 0700); err != nil {
+				t.Fatal(err)
+			}
+			synctest.Test(t, func(t *testing.T) {
+				h := &harness{s: &Server{opt: Options{Home: home}}, srv: srv}
+				entered, release, drained := make(chan struct{}), make(chan struct{}), make(chan struct{})
+				write := func() {
+					close(entered)
+					<-release
+					h.s.log("late teardown writer")
+					h.s.audit(&Agent{sid: "fixture", app: "test"}, "session end")
+				}
+				if source == "hijacked handler" {
+					h.handlers.Go(write)
+				} else {
+					h.s.locked(write)
+				}
+				<-entered
+				go func() { h.close(); close(drained) }()
+				synctest.Wait()
+				if closed(drained) {
+					t.Error("harness cleanup returned while relay writer was still active")
+				}
+				close(release)
+				synctest.Wait()
+				<-drained
+				b, err := os.ReadFile(filepath.Join(home, "relay.log"))
+				if err != nil || !strings.Contains(string(b), "late teardown writer") {
+					t.Errorf("terminal log was lost: %s, %v", b, err)
+				}
+				b, err = os.ReadFile(filepath.Join(home, "audit", time.Now().UTC().Format("2006-01-02")+".jsonl"))
+				if err != nil || !strings.Contains(string(b), `"event":"session end"`) {
+					t.Errorf("terminal audit was lost: %s, %v", b, err)
+				}
+			})
+		})
+	}
 }
 
 func (h *harness) as(c Caller, chrome bool) {
@@ -132,7 +193,7 @@ func (h *harness) dial(path string, header http.Header) *peer {
 			}
 		}
 	}()
-	h.t.Cleanup(func() { ws.Close() })
+	h.t.Cleanup(func() { ws.Close(); <-p.done })
 	return p
 }
 
@@ -398,21 +459,31 @@ func TestDisconnectDuringCreationClosesTheLateTab(t *testing.T) {
 	h := newHarness(t)
 	chrome := h.extension("me@example.com")
 	release := make(chan struct{})
+	lateTabClosed := make(chan struct{})
+	unblock := sync.OnceFunc(func() { close(release) })
+	defer unblock() // Release the fake reply before cleanup joins its reader, including after Fatal.
 	chrome.peer.mu.Lock()
 	inner := chrome.peer.answer
 	chrome.peer.answer = func(m map[string]any) (any, string) {
 		if m["op"] == "create" {
 			<-release
 		}
-		return inner(m)
+		result, err := inner(m)
+		if m["op"] == "close" {
+			close(lateTabClosed)
+		}
+		return result, err
 	}
 	chrome.peer.mu.Unlock()
 	a := h.agent("me@example.com")
 	a.send(map[string]any{"id": 1, "method": "Target.createTarget", "params": map[string]any{}})
 	chrome.next(method("create"))
+	// Only a received create can produce a late tab. Keep the extension connected
+	// until its close operation, before the client and harness joins.
+	t.Cleanup(func() { a.ws.Close(); <-lateTabClosed })
 	a.ws.Close()
 	time.Sleep(100 * time.Millisecond)
-	close(release)
+	unblock()
 	if m := chrome.next(method("close")); m["tabId"] != float64(101) {
 		t.Error("the tab Chrome made after the agent left is closed:", m)
 	}
@@ -421,11 +492,13 @@ func TestDisconnectDuringCreationClosesTheLateTab(t *testing.T) {
 func TestSocketsClosedDuringChecksAreDiscarded(t *testing.T) {
 	h := newHarness(t)
 	slow := make(chan struct{})
+	unblock := sync.OnceFunc(func() { close(slow) })
+	defer unblock()
 	h.s.caller = func(int) Caller { <-slow; return Caller{PID: 1, App: "claude"} }
 	p := h.dial("/devtools/browser/agent?token=test-secret", nil)
 	p.ws.Close()
 	time.Sleep(50 * time.Millisecond)
-	close(slow)
+	unblock()
 	time.Sleep(100 * time.Millisecond)
 	h.s.mu.Lock()
 	defer h.s.mu.Unlock()
@@ -733,11 +806,13 @@ func (c *softChip) Sign(handle, data []byte, reason, scope string, reuse time.Du
 func TestExtensionClosingDuringItsCheckIsNotRegistered(t *testing.T) {
 	h := newHarness(t)
 	slow := make(chan struct{})
+	unblock := sync.OnceFunc(func() { close(slow) })
+	defer unblock()
 	h.s.caller = func(int) Caller { <-slow; return Caller{PID: 9} }
 	p := h.dial("/extension?profile=x&client=c", http.Header{"Origin": {"chrome-extension://" + extID}})
 	p.ws.Close()
 	time.Sleep(50 * time.Millisecond)
-	close(slow)
+	unblock()
 	time.Sleep(100 * time.Millisecond)
 	h.s.mu.Lock()
 	defer h.s.mu.Unlock()
@@ -754,6 +829,8 @@ func TestDisconnectDuringPopupCreationClosesTheLateTab(t *testing.T) {
 	auditNavigate(t, chrome, a, tab, "opener-doc")
 	chrome.next(method("create")) // the tab's own creation
 	release := make(chan struct{})
+	unblock := sync.OnceFunc(func() { close(release) })
+	defer unblock()
 	chrome.peer.mu.Lock()
 	inner := chrome.peer.answer
 	chrome.peer.answer = func(m map[string]any) (any, string) {
@@ -767,7 +844,7 @@ func TestDisconnectDuringPopupCreationClosesTheLateTab(t *testing.T) {
 	chrome.next(method("create"))
 	a.ws.Close()
 	time.Sleep(100 * time.Millisecond)
-	close(release)
+	unblock()
 	if m := chrome.next(func(m map[string]any) bool { return m["op"] == "close" && m["tabId"] == float64(102) }); m == nil {
 		t.Error("the popup Chrome made after the agent left is closed")
 	}

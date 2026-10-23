@@ -51,7 +51,8 @@ type Server struct {
 	caller       func(remotePort int) Caller
 	isChrome     func(pid int) bool
 	logMu        sync.Mutex
-	watchers     atomic.Int32 // identity-file watchers running (one per connected extension), for tests
+	work         sync.WaitGroup // join child work after HTTP admission and connection handlers have ended
+	watchers     atomic.Int32   // identity-file watchers running (one per connected extension), for tests
 	// how often identities.json is checked for changes; how long a command on a tab waiting for the person's
 	// 1Password passkey approval waits before saying so
 	watchEvery, handoffWait time.Duration
@@ -306,13 +307,14 @@ func (s *Server) audit(a *Agent, event string, kv ...any) {
 		b.Write(val)
 	}
 	b.WriteString("}\n")
-	go func(line string, day string) {
+	line, day := b.String(), now.Format("2006-01-02")
+	s.work.Go(func() {
 		f, err := os.OpenFile(filepath.Join(s.opt.Home, "audit", day+".jsonl"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 		if err == nil {
 			f.WriteString(line)
 			f.Close()
 		}
-	}(b.String(), now.Format("2006-01-02"))
+	})
 }
 
 // cleanURL keeps origin and path: no query string or fragment in the audit trail.
@@ -430,7 +432,9 @@ func (s *Server) await(ch chan extReply) extReply {
 func (s *Server) extCall(p *profile, msg map[string]any) extReply { return s.await(s.extSend(p, msg)) }
 
 // locked runs f later, under the lock (a promise nobody awaits).
-func (s *Server) locked(f func()) { go func() { s.mu.Lock(); defer s.mu.Unlock(); f() }() }
+func (s *Server) locked(f func()) {
+	s.work.Go(func() { s.mu.Lock(); defer s.mu.Unlock(); f() })
+}
 
 func (s *Server) ext(email string) *profile {
 	if email != "" {
@@ -579,7 +583,7 @@ func (s *Server) accept(w http.ResponseWriter, r *http.Request) {
 	// Hold anything the client sends while we check who it is.
 	early := make(chan []byte, 1024)
 	gone := make(chan struct{})
-	go func() {
+	s.work.Go(func() {
 		defer close(gone)
 		for {
 			_, b, err := ws.ReadMessage()
@@ -588,7 +592,7 @@ func (s *Server) accept(w http.ResponseWriter, r *http.Request) {
 			}
 			early <- b
 		}
-	}()
+	})
 	if r.URL.Path == "/extension" {
 		s.acceptExtension(c, r, prof, port, seq, early, gone)
 		return
@@ -650,7 +654,7 @@ func (s *Server) acceptExtension(c *conn, r *http.Request, prof string, port, se
 			c.close(4000, "superseded by a newer connection")
 			return
 		}
-		go prev.conn.close(4000, "replaced by a newer connection")
+		s.work.Go(func() { prev.conn.close(4000, "replaced by a newer connection") })
 	}
 	if last, ok := s.last[prof]; ok && last != client {
 		s.log("a different Chrome profile now serves", prof, "- dropping the previous one's tabs")
@@ -674,7 +678,7 @@ func (s *Server) acceptExtension(c *conn, r *http.Request, prof string, port, se
 	config()
 	s.mu.Unlock()
 	s.watchers.Add(1)
-	go func() { // ping every 20s; re-send config when identities.json changes (polled every 2s, like fs.watchFile)
+	s.work.Go(func() { // ping every 20s; re-send config when identities.json changes (polled every 2s, like fs.watchFile)
 		defer s.watchers.Add(-1)
 		ids := filepath.Join(s.opt.Home, "identities.json")
 		mtime := func() time.Time {
@@ -708,7 +712,7 @@ func (s *Server) acceptExtension(c *conn, r *http.Request, prof string, port, se
 				}
 			}
 		}
-	}()
+	})
 	for {
 		var b []byte
 		select {
@@ -735,7 +739,7 @@ func (s *Server) acceptExtension(c *conn, r *http.Request, prof string, port, se
 			}
 		}
 		s.mu.Lock()
-		go func() { defer s.mu.Unlock(); s.onExtension(p, b) }()
+		s.work.Go(func() { defer s.mu.Unlock(); s.onExtension(p, b) })
 	}
 }
 
@@ -897,7 +901,7 @@ func (s *Server) acceptAgent(c *conn, r *http.Request, prof string, port int, ea
 			continue
 		}
 		s.mu.Lock() // taken here, in arrival order; released by the handler
-		go func() { defer s.mu.Unlock(); a.onMessage(m) }()
+		s.work.Go(func() { defer s.mu.Unlock(); a.onMessage(m) })
 	}
 }
 

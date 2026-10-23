@@ -122,13 +122,13 @@ func (a *Agent) init() {
 	a.targetURLs, a.urls, a.mainFrames, a.popups, a.openerOf = map[int]string{}, map[int]string{}, map[int]string{}, map[string]int{}, map[int]popupOpener{}
 	// In order: `window.open(); w.location = url` sends "open" then "nav" back to back, and "nav" needs the tab "open" creates.
 	a.pageQ = make(chan pageCall, 1024)
-	go func() {
+	a.s.work.Go(func() {
 		for c := range a.pageQ {
 			a.s.mu.Lock()
 			a.onPageCall(c.tabID, c.raw, c.from)
 			a.s.mu.Unlock()
 		}
-	}()
+	})
 }
 
 func (a *Agent) addTab(t int) {

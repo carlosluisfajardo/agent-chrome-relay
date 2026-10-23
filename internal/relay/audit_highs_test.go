@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -281,6 +282,8 @@ func TestAuditPasskeyCompletion(t *testing.T) {
 			h := newHarness(t)
 			auditKey(h)
 			chip := &auditBlockingChip{h.chip, make(chan struct{}), make(chan struct{})}
+			release := sync.OnceFunc(func() { close(chip.release) })
+			defer release() // Fatal/Goexit must unblock the signer before harness cleanup joins it.
 			h.s.chip = chip
 			f := h.extension("me@example.com")
 			a := h.agent("me@example.com")
@@ -306,7 +309,7 @@ func TestAuditPasskeyCompletion(t *testing.T) {
 				b, _ := os.ReadFile(filepath.Join(h.home, "config.json"))
 				os.WriteFile(filepath.Join(h.home, "config.json"), []byte(strings.Replace(string(b), `"enabled":false`, `"enabled":true`, 1)), 0600)
 			}
-			close(chip.release)
+			release()
 			// Wait for the handler's audited terminal outcome before examining replies.
 			deadline := time.Now().Add(5 * time.Second)
 			terminal := false
