@@ -125,7 +125,8 @@ const flush = () => { while (outbox.length && ws && ws.readyState === 1 && ws.au
 async function agentGroup(windowId) {
   await restored;
   const g = agentGroups.get(windowId);
-  return g != null && (await chrome.tabGroups.get(g).catch(() => null)) ? g : null;
+  const group = g != null ? await chrome.tabGroups.get(g).catch(() => null) : null;
+  return group?.windowId === windowId ? g : null;
 }
 const grouping = new Map(); // one group update in flight per window
 async function groupAgentTab(tabId, windowId) {
@@ -250,7 +251,13 @@ function googleAuthStep(account) {
   return { state: "waiting" };
 }
 function hostOfAuth(u) {
-  try { const url = new URL(u); for (const k of ["redirect_uri", "continue", "service_url", "origin"]) { const v = url.searchParams.get(k); if (v) return new URL(v).host; } } catch (e) {}
+  let url;
+  try { url = new URL(u); } catch (e) { return ""; }
+  for (const k of ["redirect_uri", "continue", "service_url", "origin"]) {
+    const v = url.searchParams.get(k);
+    if (!v || !/^[a-z][a-z0-9+.-]*:/i.test(v)) continue;
+    try { const host = new URL(v).hostname; if (host) return host; } catch (e) {}
+  }
   return "";
 }
 async function handleGoogleAuth(tabId) {

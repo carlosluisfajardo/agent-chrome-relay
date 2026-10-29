@@ -41,7 +41,7 @@ export async function extensionFixture({ remove, get, group, relayJSON, refuseCo
     fetch: async () => ({ json: async () => relayJSON ?? ({ port: 9333, publicKey }) }),
     TextEncoder, atob, setTimeout, clearTimeout, Date: Clock, URL });
   const source = fs.readFileSync(new URL('../../extension/sw.js', import.meta.url), 'utf8');
-  vm.runInContext(source + '\n globalThis.fixture = { handle, connect, closeAgentTabs, agentTabs, googleAuthStep };', context);
+  vm.runInContext(source + '\n globalThis.fixture = { handle, connect, closeAgentTabs, agentTabs, googleAuthStep, hostOfAuth };', context);
   await context.fixture.connect();
   const envelope = (command, socket = sockets.at(-1), nonce = new URL(socket.url).searchParams.get('nonce')) => {
     const payload = JSON.stringify({ nonce, sequence: ++socket.sequence, command });
